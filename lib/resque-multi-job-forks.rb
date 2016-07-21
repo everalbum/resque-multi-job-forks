@@ -8,6 +8,7 @@ module Resque
     attr_accessor :seconds_per_fork
     attr_accessor :jobs_per_fork
     attr_accessor :memory_threshold
+    attr_accessor :stop_handler_registered
     attr_reader   :jobs_processed
 
     def self.multi_jobs_per_fork?
@@ -16,6 +17,7 @@ module Resque
 
     if multi_jobs_per_fork? && !method_defined?(:shutdown_without_multi_job_forks)
       def perform_with_multi_job_forks(job = nil)
+        register_stop_handler unless stop_handler_registered?
         perform_without_multi_job_forks(job)
         hijack_fork unless fork_hijacked?
         @jobs_processed += 1
@@ -87,6 +89,14 @@ module Resque
       @release_fork_limit = fork_job_limit
       @jobs_processed = 0
       @cant_fork = true
+    end
+
+    def stop_handler_registered?
+      @stop_handler_registered
+    end
+
+    def register_stop_handler
+      @stop_handler_registered = true
       trap('TSTP') { shutdown }
     end
 
