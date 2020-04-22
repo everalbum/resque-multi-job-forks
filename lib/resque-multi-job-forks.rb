@@ -16,8 +16,31 @@ module Resque
     end
 
     if multi_jobs_per_fork? && !method_defined?(:shutdown_without_multi_job_forks)
+
+      def fork(&block)
+        if child = Kernel.fork
+          return child
+        else
+          if term_child
+            unregister_signal_handlers
+            trap('QUIT') { shutdown }
+          end
+          raise NotImplementedError, "Pretending to not have forked"
+          # perform_with_fork will run the job and continue working...
+        end
+      end
+
+      def work_with_multi_job_forks(*args)
+        pid # forces @pid to be set in the parent
+        work_without_multi_job_forks(*args)
+        release_and_exit! unless is_parent_process?
+      end
+      alias_method :work_without_multi_job_forks, :work
+      alias_method :work, :work_with_multi_job_forks
+
       def perform_with_multi_job_forks(job = nil)
         register_stop_handler unless stop_handler_registered?
+        @fork_per_job = true unless fork_hijacked? # reconnect and after_fork
         perform_without_multi_job_forks(job)
         hijack_fork unless fork_hijacked?
         @jobs_processed += 1
@@ -33,15 +56,15 @@ module Resque
       alias_method :shutdown?, :shutdown_with_multi_job_forks?
 
       def shutdown_with_multi_job_forks
+        shutdown_child
         shutdown_without_multi_job_forks
-        shutdown_child if is_parent_process?
       end
       alias_method :shutdown_without_multi_job_forks, :shutdown
       alias_method :shutdown, :shutdown_with_multi_job_forks
 
       def pause_processing_with_multi_job_forks
+        shutdown_child
         pause_processing_without_multi_job_forks
-        shutdown_child if is_parent_process?
       end
       alias_method :pause_processing_without_multi_job_forks, :pause_processing
       alias_method :pause_processing, :pause_processing_with_multi_job_forks
@@ -51,7 +74,7 @@ module Resque
         working_on_without_worker_registration(job)
       end
       alias_method :working_on_without_worker_registration, :working_on
-      alias_method :working_on, :working_on_with_worker_registration    
+      alias_method :working_on, :working_on_with_worker_registration
 
       # Reconnect only once
       def reconnect_with_multi_job_forks
@@ -64,18 +87,26 @@ module Resque
       alias_method :reconnect, :reconnect_with_multi_job_forks
     end
 
-    # Need to tell the child to shutdown since it might be looping performing multiple jobs per fork
-    # The TSTP signal is registered only in forked processes and calls this function
+    # Need to tell the child to shutdown since it might be looping performing
+    # multiple jobs per fork. The QUIT signal normally does a graceful shutdown,
+    # and is re-registered in children (term_child normally unregisters it).
     def shutdown_child
+      return unless @child
       begin
-        Process.kill('TSTP', @child)
+        log! "multi_jobs_per_fork: Sending QUIT signal to #{@child}"
+        Process.kill('QUIT', @child)
       rescue Errno::ESRCH
         nil
       end
     end
 
     def is_parent_process?
-      @child
+      @child || @pid == Process.pid
+    end
+
+    def release_and_exit!
+      release_fork if fork_hijacked?
+      run_at_exit_hooks ? exit : exit!(true)
     end
 
     def fork_hijacked?
@@ -88,7 +119,7 @@ module Resque
       Resque.after_fork = Resque.before_fork = nil
       @release_fork_limit = fork_job_limit
       @jobs_processed = 0
-      @cant_fork = true
+      @fork_per_job = false
     end
 
     def stop_handler_registered?
@@ -104,13 +135,13 @@ module Resque
       log "jobs processed by child: #{jobs_processed}; rss: #{rss}"
       run_hook :before_child_exit, self
       Resque.after_fork, Resque.before_fork = *@suppressed_fork_hooks
-      @release_fork_limit = @jobs_processed = @cant_fork = nil
+      @release_fork_limit = @jobs_processed = nil
       log 'hijack over, counter terrorists win.'
-      @shutdown = true unless $TESTING
+      @shutdown = true
     end
 
     def fork_job_limit
-      jobs_per_fork.nil? ? Time.now.to_i + seconds_per_fork : jobs_per_fork
+      jobs_per_fork.nil? ? Time.now.to_f + seconds_per_fork : jobs_per_fork
     end
 
     def fork_job_limit_reached?
@@ -118,7 +149,7 @@ module Resque
     end
 
     def fork_job_limit_remaining
-      jobs_per_fork.nil? ? @release_fork_limit - Time.now.to_i : jobs_per_fork - @jobs_processed
+      jobs_per_fork.nil? ? @release_fork_limit - Time.now.to_f : jobs_per_fork - @jobs_processed
     end
 
     def seconds_per_fork
@@ -150,16 +181,11 @@ module Resque
   # Call with a block to set the hook.
   # Call with no arguments to return the hook.
   def self.before_child_exit(&block)
-    if block
-      @before_child_exit ||= []
-      @before_child_exit << block
-    end
-    @before_child_exit
+    block ? register_hook(:before_child_exit, block) : hooks(:before_child_exit)
   end
 
   # Set the before_child_exit proc.
   def self.before_child_exit=(before_child_exit)
-    @before_child_exit = before_child_exit.respond_to?(:each) ? before_child_exit : [before_child_exit].compact
+    register_hook(:before_child_exit, block)
   end
-
 end

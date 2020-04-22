@@ -12,72 +12,58 @@ require 'resque-multi-job-forks'
 require 'timeout'
 
 # setup redis & resque.
-redis = Redis.new(:db => 1)
-Resque.redis = redis
+$redis = Redis.new(:db => 1)
+Resque.redis = $redis
 
 # adds simple STDOUT logging to test workers.
 # set `VERBOSE=true` when running the tests to view resques log output.
 module Resque
   class Worker
-    def log(msg)
-      puts "*** #{msg}" unless ENV['VERBOSE'].nil?
-    end
-    alias_method :log!, :log
 
-    # Processes a given job in the child.
-    def perform_without_multi_job_forks(job)
-      begin
-        # 'will_fork?' returns false in test mode, but since we need to test
-        # if the :after_fork hook runs, we ignore 'will_fork?' here.
-        run_hook :after_fork, job # if will_fork?
-        job.perform
-      rescue Object => e
-        log "#{job.inspect} failed: #{e.inspect}"
-        begin
-          job.fail(e)
-        rescue Object => e
-          log "Received exception when reporting failure: #{e.inspect}"
-        end
-        failed!
-      else
-        log "done: #{job.inspect}"
-      ensure
-        yield job if block_given?
+    def log_with_severity(severity, msg)
+      if ENV['VERBOSE']
+        s = severity.to_s[0].upcase
+        $stderr.print "*** [#{Time.now}] [#{Process.pid}] #{self} #{s}: #{msg}\n"
       end
     end
+
+    def log(message)
+      log_with_severity :info, message
+    end
+
+    def log!(message)
+      log_with_severity :debug, message
+    end
+
   end
 end
-
-# stores a record of the job processing sequence.
-# you may wish to reset this in the test `setup` method.
-$SEQUENCE = []
 
 # test job, tracks sequence.
 class SequenceJob
   @queue = :jobs
   def self.perform(i)
-    $SEQUENCE << "work_#{i}".to_sym
     sleep(2)
+    $SEQ_WRITER.print "work_#{i}\n"
   end
 end
 
 class QuickSequenceJob
   @queue = :jobs
   def self.perform(i)
-    $SEQUENCE << "work_#{i}".to_sym
+    $SEQ_WRITER.print "work_#{i}\n"
   end
 end
 
 
 # test hooks, tracks sequence.
 Resque.after_fork do
-  $SEQUENCE << :after_fork
+  $SEQ_WRITER.print "after_fork\n"
 end
 
 Resque.before_fork do
-  $SEQUENCE << :before_fork
+  $SEQ_WRITER.print "before_fork\n"
 end
 
 Resque.before_child_exit do |worker|
-  $SEQUENCE << "before_child_exit_#{worker.jobs_processed}".to_sym
+  $SEQ_WRITER.print "before_child_exit_#{worker.jobs_processed}\n"
 end
